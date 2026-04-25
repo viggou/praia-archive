@@ -1,0 +1,33 @@
+// Archive grain — tar.gz and zip support
+//
+// Usage:
+//   use "archive"
+//
+//   // Pack a directory
+//   archive.tarPack("mydir", "mydir.tar.gz")
+//   archive.zipPack("mydir", "mydir.zip")
+//
+//   // Unpack
+//   archive.tarUnpack("mydir.tar.gz", "output")
+//   archive.zipUnpack("mydir.zip", "output")
+//
+//   // In-memory
+//   let data = archive.tarCreate([{name: "hello.txt", content: "hello"}])
+//   let files = archive.tarExtract(data)
+//   print(files[0].name, files[0].content)
+
+let ext = ".dylib"
+if (sys.platform != "darwin") { ext = ".so" }
+
+let _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/archive" + ext)
+
+let tarCreate = _native.tarCreate
+let tarExtract = _native.tarExtract
+let tarPack = _native.tarPack
+let tarUnpack = _native.tarUnpack
+let zipCreate = _native.zipCreate
+let zipExtract = _native.zipExtract
+let zipPack = _native.zipPack
+let zipUnpack = _native.zipUnpack
+
+export { tarCreate, tarExtract, tarPack, tarUnpack, zipCreate, zipExtract, zipPack, zipUnpack }

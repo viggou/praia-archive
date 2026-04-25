@@ -1,0 +1,7 @@
+name: archive
+version: 0.1.0
+description: tar.gz and zip archive support for Praia
+author: Viggo Lekdorf
+license: MIT
+main: main.praia
+dependencies:
