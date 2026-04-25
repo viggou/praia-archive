@@ -66,6 +66,20 @@ static void writeFile(const std::string& path, const std::string& data) {
     f.write(data.data(), data.size());
 }
 
+// Validate that an extracted filename doesn't escape the output directory
+static std::string safePath(const std::string& outDir, const std::string& name) {
+    // Reject absolute paths and parent traversal
+    if (name.empty() || name[0] == '/' || name.find("..") != std::string::npos)
+        throw RuntimeError("archive: unsafe path in archive: " + name, 0);
+    auto full = fs::path(outDir) / name;
+    // Normalize and verify it's still under outDir
+    auto canonical_out = fs::weakly_canonical(outDir).string();
+    auto canonical_full = fs::weakly_canonical(full).string();
+    if (canonical_full.rfind(canonical_out, 0) != 0)
+        throw RuntimeError("archive: path escapes output directory: " + name, 0);
+    return canonical_full;
+}
+
 // ── Gzip compress/decompress ──
 
 static std::string gzipCompress(const std::string& data) {
@@ -285,6 +299,99 @@ static std::string deflateDecompress(const std::string& data, size_t uncompSize)
     return out;
 }
 
+// ── Zip builder (shared by zipCreate and zipPack) ──
+
+struct ZipFileEntry {
+    std::string name, content, compressed;
+    uint32_t crc, offset;
+};
+
+static std::string buildZip(std::vector<ZipFileEntry>& entries) {
+    std::string zip;
+
+    for (auto& e : entries) {
+        e.offset = static_cast<uint32_t>(zip.size());
+        writeLE32(zip, 0x04034b50);
+        writeLE16(zip, 20);        // version needed
+        writeLE16(zip, 0);         // flags
+        writeLE16(zip, 8);         // compression: deflate
+        writeLE16(zip, 0);         // mod time
+        writeLE16(zip, 0);         // mod date
+        writeLE32(zip, e.crc);
+        writeLE32(zip, static_cast<uint32_t>(e.compressed.size()));
+        writeLE32(zip, static_cast<uint32_t>(e.content.size()));
+        writeLE16(zip, static_cast<uint16_t>(e.name.size()));
+        writeLE16(zip, 0);         // extra field length
+        zip.append(e.name);
+        zip.append(e.compressed);
+    }
+
+    uint32_t cdOffset = static_cast<uint32_t>(zip.size());
+    for (auto& e : entries) {
+        writeLE32(zip, 0x02014b50);
+        writeLE16(zip, 20);         // version made by
+        writeLE16(zip, 20);         // version needed
+        writeLE16(zip, 0);          // flags
+        writeLE16(zip, 8);          // compression
+        writeLE16(zip, 0);          // mod time
+        writeLE16(zip, 0);          // mod date
+        writeLE32(zip, e.crc);
+        writeLE32(zip, static_cast<uint32_t>(e.compressed.size()));
+        writeLE32(zip, static_cast<uint32_t>(e.content.size()));
+        writeLE16(zip, static_cast<uint16_t>(e.name.size()));
+        writeLE16(zip, 0);          // extra field length
+        writeLE16(zip, 0);          // comment length
+        writeLE16(zip, 0);          // disk number
+        writeLE16(zip, 0);          // internal attrs
+        writeLE32(zip, 0);          // external attrs
+        writeLE32(zip, e.offset);
+        zip.append(e.name);
+    }
+    uint32_t cdSize = static_cast<uint32_t>(zip.size()) - cdOffset;
+
+    writeLE32(zip, 0x06054b50);
+    writeLE16(zip, 0);              // disk number
+    writeLE16(zip, 0);              // cd disk
+    writeLE16(zip, static_cast<uint16_t>(entries.size()));
+    writeLE16(zip, static_cast<uint16_t>(entries.size()));
+    writeLE32(zip, cdSize);
+    writeLE32(zip, cdOffset);
+    writeLE16(zip, 0);              // comment length
+
+    return zip;
+}
+
+static std::vector<ZipFileEntry> collectZipEntries(const std::shared_ptr<PraiaArray>& arr) {
+    std::vector<ZipFileEntry> entries;
+    for (auto& item : arr->elements) {
+        if (!item.isMap())
+            throw RuntimeError("archive: each item must be a map", 0);
+        auto& m = item.asMap()->entries;
+        auto nameIt = m.find("name");
+        if (nameIt == m.end() || !nameIt->second.isString())
+            throw RuntimeError("archive: each item must have a 'name'", 0);
+
+        ZipFileEntry ze;
+        ze.name = nameIt->second.asString();
+
+        auto contentIt = m.find("content");
+        auto pathIt = m.find("path");
+        if (contentIt != m.end() && contentIt->second.isString()) {
+            ze.content = contentIt->second.asString();
+        } else if (pathIt != m.end() && pathIt->second.isString()) {
+            ze.content = readFile(pathIt->second.asString());
+        } else {
+            throw RuntimeError("archive: each item needs 'content' or 'path'", 0);
+        }
+
+        ze.crc = crc32(0L, reinterpret_cast<const Bytef*>(ze.content.data()),
+                       static_cast<uInt>(ze.content.size()));
+        ze.compressed = deflateCompress(ze.content);
+        entries.push_back(std::move(ze));
+    }
+    return entries;
+}
+
 // ── Plugin registration ──
 
 extern "C" void praia_register(PraiaMap* module) {
@@ -379,7 +486,7 @@ extern "C" void praia_register(PraiaMap* module) {
 
             auto& outDir = args[1].asString();
             for (auto& e : entries) {
-                writeFile(outDir + "/" + e.name, e.content);
+                writeFile(safePath(outDir, e.name), e.content);
             }
             return Value(static_cast<int64_t>(entries.size()));
         }));
@@ -389,99 +496,8 @@ extern "C" void praia_register(PraiaMap* module) {
         [](const std::vector<Value>& args) -> Value {
             if (!args[0].isArray())
                 throw RuntimeError("archive.zipCreate() requires an array", 0);
-
-            struct ZipEntry {
-                std::string name;
-                std::string content;
-                std::string compressed;
-                uint32_t crc;
-                uint32_t offset;
-            };
-
-            std::vector<ZipEntry> entries;
-            for (auto& item : args[0].asArray()->elements) {
-                if (!item.isMap())
-                    throw RuntimeError("archive.zipCreate(): each item must be a map", 0);
-                auto& m = item.asMap()->entries;
-                auto nameIt = m.find("name");
-                if (nameIt == m.end() || !nameIt->second.isString())
-                    throw RuntimeError("archive.zipCreate(): each item must have a 'name'", 0);
-
-                ZipEntry ze;
-                ze.name = nameIt->second.asString();
-
-                auto contentIt = m.find("content");
-                auto pathIt = m.find("path");
-                if (contentIt != m.end() && contentIt->second.isString()) {
-                    ze.content = contentIt->second.asString();
-                } else if (pathIt != m.end() && pathIt->second.isString()) {
-                    ze.content = readFile(pathIt->second.asString());
-                } else {
-                    throw RuntimeError("archive.zipCreate(): each item needs 'content' or 'path'", 0);
-                }
-
-                ze.crc = crc32(0L, reinterpret_cast<const Bytef*>(ze.content.data()),
-                               static_cast<uInt>(ze.content.size()));
-                ze.compressed = deflateCompress(ze.content);
-                entries.push_back(std::move(ze));
-            }
-
-            std::string zip;
-
-            // Write local file headers + data
-            for (auto& e : entries) {
-                e.offset = static_cast<uint32_t>(zip.size());
-                // Local file header signature
-                writeLE32(zip, 0x04034b50);
-                writeLE16(zip, 20);        // version needed
-                writeLE16(zip, 0);         // flags
-                writeLE16(zip, 8);         // compression: deflate
-                writeLE16(zip, 0);         // mod time
-                writeLE16(zip, 0);         // mod date
-                writeLE32(zip, e.crc);
-                writeLE32(zip, static_cast<uint32_t>(e.compressed.size()));
-                writeLE32(zip, static_cast<uint32_t>(e.content.size()));
-                writeLE16(zip, static_cast<uint16_t>(e.name.size()));
-                writeLE16(zip, 0);         // extra field length
-                zip.append(e.name);
-                zip.append(e.compressed);
-            }
-
-            // Central directory
-            uint32_t cdOffset = static_cast<uint32_t>(zip.size());
-            for (auto& e : entries) {
-                writeLE32(zip, 0x02014b50); // central dir signature
-                writeLE16(zip, 20);         // version made by
-                writeLE16(zip, 20);         // version needed
-                writeLE16(zip, 0);          // flags
-                writeLE16(zip, 8);          // compression
-                writeLE16(zip, 0);          // mod time
-                writeLE16(zip, 0);          // mod date
-                writeLE32(zip, e.crc);
-                writeLE32(zip, static_cast<uint32_t>(e.compressed.size()));
-                writeLE32(zip, static_cast<uint32_t>(e.content.size()));
-                writeLE16(zip, static_cast<uint16_t>(e.name.size()));
-                writeLE16(zip, 0);          // extra field length
-                writeLE16(zip, 0);          // comment length
-                writeLE16(zip, 0);          // disk number
-                writeLE16(zip, 0);          // internal attrs
-                writeLE32(zip, 0);          // external attrs
-                writeLE32(zip, e.offset);   // local header offset
-                zip.append(e.name);
-            }
-            uint32_t cdSize = static_cast<uint32_t>(zip.size()) - cdOffset;
-
-            // End of central directory
-            writeLE32(zip, 0x06054b50);
-            writeLE16(zip, 0);              // disk number
-            writeLE16(zip, 0);              // cd disk
-            writeLE16(zip, static_cast<uint16_t>(entries.size()));
-            writeLE16(zip, static_cast<uint16_t>(entries.size()));
-            writeLE32(zip, cdSize);
-            writeLE32(zip, cdOffset);
-            writeLE16(zip, 0);              // comment length
-
-            return Value(std::move(zip));
+            auto entries = collectZipEntries(args[0].asArray());
+            return Value(buildZip(entries));
         }));
 
     // archive.zipExtract(data) — extract a .zip, returns array of {name, content}
@@ -499,7 +515,6 @@ extern "C" void praia_register(PraiaMap* module) {
                 if (sig != 0x04034b50) break; // not a local file header
 
                 uint16_t method = readLE16(data.data() + pos + 8);
-                uint32_t crc = readLE32(data.data() + pos + 14);
                 uint32_t compSize = readLE32(data.data() + pos + 18);
                 uint32_t uncompSize = readLE32(data.data() + pos + 22);
                 uint16_t nameLen = readLE16(data.data() + pos + 26);
@@ -510,15 +525,12 @@ extern "C" void praia_register(PraiaMap* module) {
 
                 std::string content;
                 if (method == 0) {
-                    // stored
                     content = data.substr(pos, uncompSize);
                 } else if (method == 8) {
-                    // deflate
                     content = deflateDecompress(data.substr(pos, compSize), uncompSize);
                 }
                 pos += compSize;
 
-                // Skip directories
                 if (!name.empty() && name.back() != '/') {
                     auto entry = gcNew<PraiaMap>();
                     entry->entries["name"] = Value(name);
@@ -541,72 +553,19 @@ extern "C" void praia_register(PraiaMap* module) {
             if (!fs::is_directory(dir))
                 throw RuntimeError("archive.zipPack(): not a directory: " + dir, 0);
 
-            // Collect files
-            auto filesArr = gcNew<PraiaArray>();
+            std::vector<ZipFileEntry> entries;
             for (auto& entry : fs::recursive_directory_iterator(dir)) {
                 if (!entry.is_regular_file()) continue;
-                auto rel = fs::relative(entry.path(), dir).string();
-                auto m = gcNew<PraiaMap>();
-                m->entries["name"] = Value(rel);
-                m->entries["path"] = Value(entry.path().string());
-                filesArr->elements.push_back(Value(m));
-            }
-
-            // Call zipCreate
-            std::vector<Value> createArgs = {Value(filesArr)};
-
-            // Inline the logic: read files and create zip
-            struct ZipEntry {
-                std::string name, content, compressed;
-                uint32_t crc, offset;
-            };
-            std::vector<ZipEntry> entries;
-            for (auto& item : filesArr->elements) {
-                auto& m = item.asMap()->entries;
-                ZipEntry ze;
-                ze.name = m["name"].asString();
-                ze.content = readFile(m["path"].asString());
+                ZipFileEntry ze;
+                ze.name = fs::relative(entry.path(), dir).string();
+                ze.content = readFile(entry.path().string());
                 ze.crc = crc32(0L, reinterpret_cast<const Bytef*>(ze.content.data()),
                                static_cast<uInt>(ze.content.size()));
                 ze.compressed = deflateCompress(ze.content);
                 entries.push_back(std::move(ze));
             }
 
-            std::string zip;
-            for (auto& e : entries) {
-                e.offset = static_cast<uint32_t>(zip.size());
-                writeLE32(zip, 0x04034b50);
-                writeLE16(zip, 20); writeLE16(zip, 0); writeLE16(zip, 8);
-                writeLE16(zip, 0); writeLE16(zip, 0);
-                writeLE32(zip, e.crc);
-                writeLE32(zip, static_cast<uint32_t>(e.compressed.size()));
-                writeLE32(zip, static_cast<uint32_t>(e.content.size()));
-                writeLE16(zip, static_cast<uint16_t>(e.name.size()));
-                writeLE16(zip, 0);
-                zip.append(e.name);
-                zip.append(e.compressed);
-            }
-            uint32_t cdOffset = static_cast<uint32_t>(zip.size());
-            for (auto& e : entries) {
-                writeLE32(zip, 0x02014b50);
-                writeLE16(zip, 20); writeLE16(zip, 20); writeLE16(zip, 0); writeLE16(zip, 8);
-                writeLE16(zip, 0); writeLE16(zip, 0);
-                writeLE32(zip, e.crc);
-                writeLE32(zip, static_cast<uint32_t>(e.compressed.size()));
-                writeLE32(zip, static_cast<uint32_t>(e.content.size()));
-                writeLE16(zip, static_cast<uint16_t>(e.name.size()));
-                writeLE16(zip, 0); writeLE16(zip, 0); writeLE16(zip, 0);
-                writeLE16(zip, 0); writeLE32(zip, 0); writeLE32(zip, e.offset);
-                zip.append(e.name);
-            }
-            uint32_t cdSize = static_cast<uint32_t>(zip.size()) - cdOffset;
-            writeLE32(zip, 0x06054b50);
-            writeLE16(zip, 0); writeLE16(zip, 0);
-            writeLE16(zip, static_cast<uint16_t>(entries.size()));
-            writeLE16(zip, static_cast<uint16_t>(entries.size()));
-            writeLE32(zip, cdSize); writeLE32(zip, cdOffset); writeLE16(zip, 0);
-
-            writeFile(outPath, zip);
+            writeFile(outPath, buildZip(entries));
             return Value(static_cast<int64_t>(entries.size()));
         }));
 
@@ -641,7 +600,7 @@ extern "C" void praia_register(PraiaMap* module) {
                     } else if (method == 8) {
                         content = deflateDecompress(data.substr(pos, compSize), uncompSize);
                     }
-                    writeFile(outDir + "/" + name, content);
+                    writeFile(safePath(outDir, name), content);
                     count++;
                 }
                 pos += compSize;
