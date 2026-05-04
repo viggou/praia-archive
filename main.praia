@@ -17,7 +17,10 @@
 //   print(files[0].name, files[0].content)
 
 let ext = ".dylib"
-if (sys.platform != "darwin") { ext = ".so" }
+if (sys.platform != "darwin") {
+    let arch = sys.exec(["uname", "-m"]).stdout.strip()
+    ext = "-linux-" + arch + ".so"
+}
 
 let _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/archive" + ext)
 
