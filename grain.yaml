@@ -1,5 +1,5 @@
 name: archive
-version: 1.0.0
+version: 1.1.0
 description: tar.gz and zip archive support for Praia
 author: Viggo Lekdorf
 license: MIT

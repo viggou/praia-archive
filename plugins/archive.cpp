@@ -11,6 +11,20 @@
 
 namespace fs = std::filesystem;
 
+PRAIA_DECLARE_ABI();
+PRAIA_PLUGIN_METADATA("archive", "0.2.0",
+                     "tar.gz and zip archive support");
+
+// Bail out of a long pack/unpack loop if the surrounding withCancel
+// scope's token has been cancelled. Returns true if cancelled; the
+// caller throws to surface the bail-out to user code. Polled once
+// per archive entry (typical archives have hundreds-to-thousands of
+// entries, not millions, so an unconditional check beats amortising).
+static bool archiveCancelled() {
+    auto c = praia::shouldCancel();
+    return c && *c;
+}
+
 // ── Tar format helpers ──
 
 struct TarHeader {
@@ -463,6 +477,8 @@ extern "C" void praia_register(PraiaMap* module) {
 
             std::vector<std::pair<std::string, std::string>> files;
             for (auto& entry : fs::recursive_directory_iterator(dir)) {
+                if (archiveCancelled())
+                    throw RuntimeError("archive.tarPack: cancelled", 0);
                 if (!entry.is_regular_file()) continue;
                 auto rel = fs::relative(entry.path(), dir).string();
                 files.push_back({rel, readFile(entry.path().string())});
@@ -486,6 +502,8 @@ extern "C" void praia_register(PraiaMap* module) {
 
             auto& outDir = args[1].asString();
             for (auto& e : entries) {
+                if (archiveCancelled())
+                    throw RuntimeError("archive.tarUnpack: cancelled", 0);
                 writeFile(safePath(outDir, e.name), e.content);
             }
             return Value(static_cast<int64_t>(entries.size()));
@@ -511,6 +529,8 @@ extern "C" void praia_register(PraiaMap* module) {
 
             size_t pos = 0;
             while (pos + 30 <= data.size()) {
+                if (archiveCancelled())
+                    throw RuntimeError("archive.zipExtract: cancelled", 0);
                 uint32_t sig = readLE32(data.data() + pos);
                 if (sig != 0x04034b50) break; // not a local file header
 
@@ -555,6 +575,8 @@ extern "C" void praia_register(PraiaMap* module) {
 
             std::vector<ZipFileEntry> entries;
             for (auto& entry : fs::recursive_directory_iterator(dir)) {
+                if (archiveCancelled())
+                    throw RuntimeError("archive.zipPack: cancelled", 0);
                 if (!entry.is_regular_file()) continue;
                 ZipFileEntry ze;
                 ze.name = fs::relative(entry.path(), dir).string();
@@ -581,6 +603,8 @@ extern "C" void praia_register(PraiaMap* module) {
 
             size_t pos = 0;
             while (pos + 30 <= data.size()) {
+                if (archiveCancelled())
+                    throw RuntimeError("archive.zipUnpack: cancelled", 0);
                 uint32_t sig = readLE32(data.data() + pos);
                 if (sig != 0x04034b50) break;
 
